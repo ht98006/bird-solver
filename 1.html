@@ -1,0 +1,1078 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>小鳥解題器</title>
+<style>
+  body{font-family:system-ui,-apple-system,"Noto Sans TC",sans-serif;max-width:520px;margin:0 auto;padding:12px 16px 40px;background:#fafafa;color:#222}
+  h1{font-size:1.3rem;margin:.4em 0}
+  .hint{font-size:.85rem;color:#666;line-height:1.5}
+  .row{display:flex;gap:10px;align-items:center;margin:10px 0}
+  .btn{flex:1;text-align:center;padding:14px 8px;border-radius:12px;background:#6c4ff0;color:#fff;font-size:1.05rem;cursor:pointer}
+  .btn.alt{background:#fff;color:#6c4ff0;border:2px solid #6c4ff0}
+  select{font-size:1rem;padding:4px 8px}
+  #msg{min-height:1.4em;margin:8px 0;font-weight:600}
+  canvas{width:100%;height:auto;border-radius:10px;background:#eee;display:block}
+  #ov{position:absolute;height:100%}
+  #ov.frozen{position:static;height:auto}
+  #grid{display:grid;gap:2px;margin-top:14px}
+  .cell{aspect-ratio:1;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:1.3rem;cursor:pointer;user-select:none}
+</style>
+</head>
+<body>
+<h1>🐦 小鳥解題器</h1>
+<p class="hint">拍下（或選截圖）遊戲盤面，自動算出每隻小鳥的位置。用截圖比拍螢幕準。</p>
+
+<div class="row">
+  <label class="btn">📷 拍照<input id="cam" type="file" accept="image/*" capture="environment" hidden></label>
+  <label class="btn alt">🖼️ 選圖片<input id="pick" type="file" accept="image/*" hidden></label>
+</div>
+<div class="row">格數
+  <select id="nsel">
+    <option value="auto">自動</option>
+    <option>4</option><option>5</option><option>6</option><option>7</option><option>8</option>
+    <option>9</option><option>10</option><option>11</option><option>12</option>
+  </select>
+</div>
+
+<div class="row">
+  <div class="btn" id="livebtn" style="background:#e53935">🎥 即時模式</div>
+  <div class="btn alt" id="relock" style="display:none">🔄 重新偵測</div>
+</div>
+<div class="row" id="liveeditrow" style="display:none">
+  <button type="button" class="btn alt" id="liveedit" disabled>定格修角</button>
+</div>
+<label class="hint" id="autolbl" style="display:none"><input type="checkbox" id="autosave" checked> 解出後自動截圖並下載到手機</label>
+<div id="msg">請先拍照或選圖片，或開即時模式</div>
+<div id="livebox" style="display:none;position:relative">
+  <video id="vid" playsinline muted autoplay style="width:100%;border-radius:10px;display:block;background:#000"></video>
+  <canvas id="ov" style="left:0;top:0;width:100%;pointer-events:none;background:none"></canvas>
+</div>
+<canvas id="view" width="300" height="200"></canvas>
+<div id="snapbox" style="display:none">
+  <p class="hint">📸 最新答案截圖（長按圖片也能儲存）</p>
+  <img id="snap" alt="截圖" style="width:100%;border-radius:10px;display:block">
+  <div class="row"><a id="dl" class="btn" download="bird-answer.png">💾 儲存截圖</a></div>
+</div>
+<div id="grid"></div>
+<p class="hint">辨識錯了？<br>① 拖曳照片上的紅點，對齊盤面四個角。<br>② 點下方色塊可切換該格的顏色分組，答案會即時重算。<br>③ 格數抓錯時，手動選擇格數。</p>
+
+<script>
+// ==CORE_START==
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+function rgb2lab(r, g, b) {
+  const f = v => { v /= 255; return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+  const R = f(r), G = f(g), B = f(b);
+  let X = (0.4124 * R + 0.3576 * G + 0.1805 * B) / 0.95047;
+  let Y = 0.2126 * R + 0.7152 * G + 0.0722 * B;
+  let Z = (0.0193 * R + 0.1192 * G + 0.9505 * B) / 1.08883;
+  const h = t => t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116;
+  X = h(X); Y = h(Y); Z = h(Z);
+  return [116 * Y - 16, 500 * (X - Y), 200 * (Y - Z)];
+}
+
+// 找盤面：飽和度遮罩 -> 膨脹補起格線 -> 最大近似方形連通區 -> 取四個極端角
+function dilate(m, w, h, R) {
+  const t = new Uint8Array(w * h), o = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let v = 0;
+    for (let k = -R; k <= R && !v; k++) { const xx = x + k; if (xx >= 0 && xx < w && m[y * w + xx]) v = 1; }
+    t[y * w + x] = v;
+  }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let v = 0;
+    for (let k = -R; k <= R && !v; k++) { const yy = y + k; if (yy >= 0 && yy < h && t[yy * w + x]) v = 1; }
+    o[y * w + x] = v;
+  }
+  return o;
+}
+
+// 從較亮且接近中性的像素找出最常見的螢幕底色，包含相機白平衡造成的色偏。
+function screenBackground(data, W, H, f) {
+  const bins = new Map();
+  let best = null;
+  const step = f * 2;
+  for (let y = 0; y < H; y += step) for (let x = 0; x < W; x += step) {
+    const i = (y * W + x) * 4;
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    const mn = Math.min(r, g, b);
+    if (mn < 145 || Math.max(r, g, b) - mn > 24) continue;
+    const key = ((r >> 2) << 12) | ((g >> 2) << 6) | (b >> 2);
+    if (!bins.has(key)) bins.set(key, { count: 0, sum: [0, 0, 0] });
+    const bin = bins.get(key);
+    bin.sum[0] += r; bin.sum[1] += g; bin.sum[2] += b;
+    bin.count++;
+    if (!best || bin.count > best.count) best = bin;
+  }
+  return best && best.count >= (W * H / (step * step)) * 0.015
+    ? best.sum.map(v => v / best.count) : null;
+}
+
+function findGrid(img, mode) {
+  const { data, width: W, height: H } = img;
+  const f = Math.max(1, Math.round(Math.max(W, H) / 400));
+  const w = Math.floor(W / f), h = Math.floor(H / f);
+  const mask = new Uint8Array(w * h);
+  const bg = mode === 'background' ? screenBackground(data, W, H, f) : null;
+  if (mode === 'background' && !bg) return null;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = ((y * f) * W + (x * f)) * 4;
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+    // sat：鮮豔色（拍照用，背景是淡色）；white：只要不是近白就算（乾淨截圖用，能抓到淡紫等低飽和色塊）
+    const chroma = mx - mn;
+    let on;
+    if (bg) on = mx > 135 && Math.max(Math.abs(r - bg[0]), Math.abs(g - bg[1]), Math.abs(b - bg[2])) >= 5;
+    else if (mode === 'pastel') on = mx > 75 && chroma >= 8;
+    else if (mode === 'white') on = mn < 228;
+    else on = mx > 60 && chroma / (mx + 1) > 0.28;
+    if (on) mask[y * w + x] = 1;
+  }
+  const dil = dilate(mask, w, h, bg || mode === 'pastel' ? 3 : 2);
+  const lab = new Int32Array(w * h);
+  let best = null, id = 0;
+  const stack = [];
+  for (let s = 0; s < w * h; s++) {
+    if (!dil[s] || lab[s]) continue;
+    id++; lab[s] = id; stack.push(s);
+    let area = 0, x0 = w, y0 = h, x1 = 0, y1 = 0;
+    while (stack.length) {
+      const p = stack.pop(), px = p % w, py = (p / w) | 0;
+      area++;
+      if (px < x0) x0 = px; if (px > x1) x1 = px;
+      if (py < y0) y0 = py; if (py > y1) y1 = py;
+      if (px > 0 && dil[p - 1] && !lab[p - 1]) { lab[p - 1] = id; stack.push(p - 1); }
+      if (px < w - 1 && dil[p + 1] && !lab[p + 1]) { lab[p + 1] = id; stack.push(p + 1); }
+      if (py > 0 && dil[p - w] && !lab[p - w]) { lab[p - w] = id; stack.push(p - w); }
+      if (py < h - 1 && dil[p + w] && !lab[p + w]) { lab[p + w] = id; stack.push(p + w); }
+    }
+    const bw = x1 - x0 + 1, bh = y1 - y0 + 1, asp = bw / bh, fill = area / (bw * bh);
+    if (asp < 0.5 || asp > 2 || area < 200) continue;
+    const score = area * fill;
+    if (!best || score > best.score) best = { id, score };
+  }
+  if (!best) return null;
+  // 用行/列密度裁掉黏在盤面旁的雜物（手指、手機殼、下方圖示）
+  const longestRun = (cnt, lo, hi) => {
+    const mx = Math.max(...cnt.slice(lo, hi + 1));
+    let bs = lo, bl2 = 0, s = -1;
+    for (let i = lo; i <= hi + 1; i++) {
+      const on = i <= hi && cnt[i] >= 0.5 * mx;
+      if (on && s < 0) s = i;
+      if (!on && s >= 0) { if (i - s > bl2) { bl2 = i - s; bs = s; } s = -1; }
+    }
+    return [bs, bs + bl2 - 1];
+  };
+  const rowCnt = new Array(h).fill(0), colCnt = new Array(w).fill(0);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++)
+    if (lab[y * w + x] === best.id) rowCnt[y]++;
+  const [ya, yb] = longestRun(rowCnt, 0, h - 1);
+  for (let y = ya; y <= yb; y++) for (let x = 0; x < w; x++)
+    if (lab[y * w + x] === best.id) colCnt[x]++;
+  const [xa, xb] = longestRun(colCnt, 0, w - 1);
+  let tl, tr, br, bl, mnS = 1e9, mxS = -1e9, mnD = 1e9, mxD = -1e9;
+  for (let y = Math.max(0, ya - 2); y <= Math.min(h - 1, yb + 2); y++)
+  for (let x = Math.max(0, xa - 2); x <= Math.min(w - 1, xb + 2); x++) {
+    const p = y * w + x;
+    if (lab[p] !== best.id || !mask[p]) continue;
+    const s = x + y, d = x - y;
+    if (s < mnS) { mnS = s; tl = [x, y]; }
+    if (s > mxS) { mxS = s; br = [x, y]; }
+    if (d < mnD) { mnD = d; bl = [x, y]; }
+    if (d > mxD) { mxD = d; tr = [x, y]; }
+  }
+  return [tl, tr, br, bl].map(p => [p[0] * f + f / 2, p[1] * f + f / 2]);
+}
+
+// 透視變換
+function solveH(src, dst) {
+  const A = [], b = [];
+  for (let i = 0; i < 4; i++) {
+    const [x, y] = src[i], [u, v] = dst[i];
+    A.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); b.push(u);
+    A.push([0, 0, 0, x, y, 1, -v * x, -v * y]); b.push(v);
+  }
+  const n = 8;
+  for (let i = 0; i < n; i++) {
+    let p = i;
+    for (let r = i + 1; r < n; r++) if (Math.abs(A[r][i]) > Math.abs(A[p][i])) p = r;
+    [A[i], A[p]] = [A[p], A[i]]; [b[i], b[p]] = [b[p], b[i]];
+    for (let r = i + 1; r < n; r++) {
+      const f = A[r][i] / A[i][i];
+      for (let c = i; c < n; c++) A[r][c] -= f * A[i][c];
+      b[r] -= f * b[i];
+    }
+  }
+  const h = new Array(8);
+  for (let i = n - 1; i >= 0; i--) {
+    let s = b[i];
+    for (let c = i + 1; c < n; c++) s -= A[i][c] * h[c];
+    h[i] = s / A[i][i];
+  }
+  return [...h, 1];
+}
+function applyH(h, x, y) {
+  const w = h[6] * x + h[7] * y + h[8];
+  return [(h[0] * x + h[1] * y + h[2]) / w, (h[3] * x + h[4] * y + h[5]) / w];
+}
+
+// 把四邊形拉正成 S×S；H 是「校正圖座標 -> 原照片座標」
+function warp(img, quad, S) {
+  const H = solveH([[0, 0], [S, 0], [S, S], [0, S]], quad);
+  const out = new Uint8ClampedArray(S * S * 4);
+  const { data, width: W, height: Ht } = img;
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const [px, py] = applyH(H, x + 0.5, y + 0.5);
+    const xi = clamp(Math.round(px), 0, W - 1), yi = clamp(Math.round(py), 0, Ht - 1);
+    const si = (yi * W + xi) * 4, di = (y * S + x) * 4;
+    out[di] = data[si]; out[di + 1] = data[si + 1]; out[di + 2] = data[si + 2]; out[di + 3] = 255;
+  }
+  return { data: out, width: S, height: S, H };
+}
+
+const labDist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+
+// 每格顏色 = 中心區中位數。
+// 已放下的小鳥圖案有黑色眼睛：格子中央出現一定比例的近黑像素，就把該格標成「未知」
+// （顏色被圖案蓋住了），之後用規則推算它屬於哪個色塊。
+function cellColors(w, n) {
+  const S = w.width, cs = S / n, rgbs = [], unknown = [];
+  const med = a => { a = a.slice().sort((p, q) => p - q); return a[a.length >> 1]; };
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) {
+    const R = [], G = [], B = [];
+    let dark = 0, tot = 0;
+    for (let y = Math.floor((r + 0.2) * cs); y < Math.floor((r + 0.8) * cs); y++)
+      for (let x = Math.floor((c + 0.2) * cs); x < Math.floor((c + 0.8) * cs); x++) {
+        const i = (y * S + x) * 4;
+        const rr = w.data[i], gg = w.data[i + 1], bb = w.data[i + 2];
+        tot++; if (Math.max(rr, gg, bb) < 70) dark++;
+        const inC = x >= (c + 0.3) * cs && x < (c + 0.7) * cs && y >= (r + 0.3) * cs && y < (r + 0.7) * cs;
+        if (inC) { R.push(rr); G.push(gg); B.push(bb); }
+      }
+    rgbs.push([med(R), med(G), med(B)]);
+    unknown.push(dark / tot > 0.012);
+  }
+  return { rgbs, unknown };
+}
+
+// 顏色分區：只合併「上下左右相鄰」且顏色最接近的格子，直到剩 n 區。
+// 同一色塊必相連，所以光影漸層（陰影、反光）不會把一個色塊切成兩個，
+// 不相連的相近色（如黃 / 深黃）也不會被誤併。未知格不參與合併，asg 記為 -1。
+function segment(rgbs, n, unknown) {
+  unknown = unknown || [];
+  const labs = rgbs.map(c => rgb2lab(c[0], c[1], c[2]));
+  const N = labs.length, par = Array.from({ length: N }, (_, i) => i);
+  const find = i => { while (par[i] !== i) { par[i] = par[par[i]]; i = par[i]; } return i; };
+  const edges = [];
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) {
+    const i = r * n + c;
+    if (unknown[i]) continue;
+    // 往右、往下找第一個「已知」的格子連起來；中間隔著被小鳥圖案蓋住的格子也要能連（略加懲罰）
+    for (const [dr, dc] of [[0, 1], [1, 0]]) {
+      let rr = r + dr, cc = c + dc, jump = 0;
+      while (rr < n && cc < n && unknown[rr * n + cc]) { rr += dr; cc += dc; jump++; }
+      if (rr < n && cc < n) edges.push([labDist(labs[i], labs[rr * n + cc]) + jump * 4, i, rr * n + cc]);
+    }
+  }
+  edges.sort((a, b) => a[0] - b[0]);
+  let comps = N - unknown.filter(Boolean).length;
+  for (const [, a, b] of edges) {
+    if (comps <= n) break;
+    const x = find(a), y = find(b);
+    if (x !== y) { par[x] = y; comps--; }
+  }
+  const ids = new Map();
+  const asg = labs.map((_, i) => {
+    if (unknown[i]) return -1;
+    const r = find(i); if (!ids.has(r)) ids.set(r, ids.size); return ids.get(r);
+  });
+  const k = ids.size, mean = [], cen = [];
+  for (let j = 0; j < k; j++) {
+    const idx = asg.map((v, i) => v === j ? i : -1).filter(i => i >= 0);
+    mean.push([0, 1, 2].map(t => Math.round(idx.reduce((s, i) => s + rgbs[i][t], 0) / idx.length)));
+    cen.push([0, 1, 2].map(t => idx.reduce((s, i) => s + labs[i][t], 0) / idx.length));
+  }
+  let sse = 0, cnt = 0;
+  labs.forEach((l, i) => { if (asg[i] >= 0) { const d = labDist(l, cen[asg[i]]); sse += d * d; cnt++; } });
+  return { asg, mean, sse: cnt ? sse / cnt : 1e9 };
+}
+
+// 格數自動判斷：由小到大試，第一個「顏色分得乾淨且有解」的就是答案
+function tryN(w, n) {
+  const { rgbs, unknown } = cellColors(w, n);
+  const km = segment(rgbs, n, unknown);
+  const groups = Array.from({ length: n }, (_, r) => km.asg.slice(r * n, r * n + n));
+  const unk = [];
+  unknown.forEach((u, i) => { if (u) unk.push([Math.floor(i / n), i % n]); });
+  const k = km.mean.length;
+  while (km.mean.length < n) km.mean.push([200, 200, 200]);
+  let sol = null;
+  if (!unk.length) sol = solveGrid(groups);
+  else if (unk.length <= 4) {
+    // 未知格可能屬於相鄰的色塊，或（若顏色數不足）是只有一格的新色塊；
+    // 逐一嘗試，優先採用「有解、且解的小鳥剛好落在該格」的組合（那格本來就放了小鳥）。
+    const cand = unk.map(([r, c]) => {
+      const set = new Set();
+      [[r - 1, c], [r + 1, c], [r, c - 1], [r, c + 1]].forEach(([y, x]) => {
+        if (y >= 0 && y < n && x >= 0 && x < n && groups[y][x] >= 0) set.add(groups[y][x]);
+      });
+      for (let g = k; g < n; g++) set.add(g);
+      if (!set.size) for (let g = 0; g < n; g++) set.add(g);
+      return [...set];
+    });
+    let first = null, best = null, cnt = 0;
+    const copy = () => groups.map(r => r.slice());
+    const rec = i => {
+      if (best || cnt > 20000) return;
+      if (i === unk.length) {
+        cnt++;
+        const s2 = solveGrid(groups);
+        if (s2) {
+          if (!first) first = { g: copy(), s: s2 };
+          if (unk.every(([r, c]) => s2[r] === c)) best = { g: copy(), s: s2 };
+        }
+        return;
+      }
+      const [r, c] = unk[i];
+      for (const g of cand[i]) { groups[r][c] = g; rec(i + 1); if (best) return; }
+    };
+    rec(0);
+    const pick = best || first;
+    if (pick) { pick.g.forEach((row, r) => row.forEach((v, c) => { groups[r][c] = v; })); sol = pick.s; }
+    else unk.forEach(([r, c], i) => { groups[r][c] = cand[i][0]; });
+  } else {
+    unk.forEach(([r, c]) => { groups[r][c] = 0; });
+  }
+  km.mean = km.mean.slice(0, n);
+  return { n, km, groups, sse: km.sse, sol, unk: unk.length };
+}
+// 兩種方式各找一次盤面，挑「格線吻合、顏色分得乾淨、有解」的那個
+function findQuad(img, S, forceN) {
+  S = S || 600;
+  let best = null, bs = -1e9;
+  for (const mode of ['sat', 'white']) {
+    const q = findGrid(img, mode);
+    if (!q) continue;
+    const w = warp(img, q, S), t = forceN ? tryN(w, forceN) : autoN(w);
+    const sc = (t.sol ? 1 : 0) + gapScore(w, t.n) - t.sse * 0.005;
+    if (sc > bs) { bs = sc; best = q; q.mode = mode; q.t = t; q.H = w.H; q.S = S; }
+  }
+  return best;
+}
+
+// 格線吻合度：n 對的話，預期的每條格線位置都會有一條淺色縫隙
+function gapScore(w, n) {
+  const S = w.width, col = new Float32Array(S), row = new Float32Array(S);
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const i = (y * S + x) * 4;
+    const r = w.data[i], g = w.data[i + 1], b = w.data[i + 2];
+    const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+    if (mx > 150 && (mx - mn) / (mx + 1) < 0.2) { col[x]++; row[y]++; }
+  }
+  const win = Math.round(S * 0.025);
+  let sum = 0;
+  for (let k = 1; k < n; k++) {
+    const pos = Math.round(k * S / n);
+    let mc = 0, mr = 0;
+    for (let d = -win; d <= win; d++) {
+      const p = clamp(pos + d, 0, S - 1);
+      mc = Math.max(mc, col[p]); mr = Math.max(mr, row[p]);
+    }
+    sum += (mc + mr) / (2 * S);
+  }
+  return sum / (n - 1);
+}
+function autoN(w, log) {
+  const all = [];
+  for (let n = 4; n <= 12; n++) {
+    const t = tryN(w, n);
+    if (t.sol) all.push(t);
+    if (log) log(n, t.sse, !!t.sol);
+  }
+  if (!all.length) return tryN(w, 9);
+  let pool = all.filter(t => t.sse < 30);
+  if (!pool.length) { const m = Math.min(...all.map(t => t.sse)); pool = all.filter(t => t.sse === m); }
+  let best = null, bs = -1;
+  pool.forEach(t => { const g = gapScore(w, t.n); if (g > bs) { bs = g; best = t; } });
+  return best;
+}
+
+// 回溯解題：每色一隻、每列每欄一隻、小鳥不相鄰（含斜角）
+function solveGrid(g) {
+  const n = g.length, cols = [], usedC = new Array(n).fill(false), usedK = new Set();
+  function bt(r) {
+    if (r === n) return true;
+    for (let c = 0; c < n; c++) {
+      if (usedC[c]) continue;
+      const k = g[r][c];
+      if (usedK.has(k)) continue;
+      if (r > 0 && Math.abs(cols[r - 1] - c) < 2) continue;
+      usedC[c] = true; usedK.add(k); cols[r] = c;
+      if (bt(r + 1)) return true;
+      usedC[c] = false; usedK.delete(k);
+    }
+    return false;
+  }
+  return bt(0) ? cols.slice() : null;
+}
+
+// 3×3 平均模糊（壓低相機雜訊，即時模式用）
+function boxBlur(img) {
+  const { data, width: W, height: H } = img, t = new Uint16Array(W * H * 3), out = new Uint8ClampedArray(W * H * 4);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const x0 = Math.max(0, x - 1), x1 = Math.min(W - 1, x + 1), cnt = x1 - x0 + 1;
+    for (let k = 0; k < 3; k++) {
+      let s = 0;
+      for (let xx = x0; xx <= x1; xx++) s += data[(y * W + xx) * 4 + k];
+      t[(y * W + x) * 3 + k] = s * 3 / cnt;
+    }
+  }
+  for (let y = 0; y < H; y++) {
+    const y0 = Math.max(0, y - 1), y1 = Math.min(H - 1, y + 1), cnt = y1 - y0 + 1;
+    for (let x = 0; x < W; x++) for (let k = 0; k < 3; k++) {
+      let s = 0;
+      for (let yy = y0; yy <= y1; yy++) s += t[(yy * W + x) * 3 + k];
+      out[(y * W + x) * 4 + k] = s / (3 * cnt);
+    }
+    for (let x = 0; x < W; x++) out[(y * W + x) * 4 + 3] = 255;
+  }
+  return { data: out, width: W, height: H };
+}
+
+// 在每軸的三段分別檢查格線，避免斜切的框只靠一側剛好對上格線。
+function liveGridProfiles(w) {
+  const S = w.width, lo = Math.round(S * 0.08), hi = S - lo;
+  const rows = [], cols = [];
+  for (let band = 0; band < 3; band++) {
+    const from = lo + Math.round((hi - lo) * band / 3);
+    const to = lo + Math.round((hi - lo) * (band + 1) / 3);
+    const row = new Float32Array(S), col = new Float32Array(S);
+    for (let pos = 0; pos < S; pos++) for (let p = from; p < to; p++) {
+      const a = (pos * S + p) * 4, b = (p * S + pos) * 4;
+      row[pos] += Math.min(w.data[a], w.data[a + 1], w.data[a + 2]);
+      col[pos] += Math.min(w.data[b], w.data[b + 1], w.data[b + 2]);
+    }
+    rows.push(row.map(v => v / (to - from)));
+    cols.push(col.map(v => v / (to - from)));
+  }
+  return [rows, cols];
+}
+
+function liveGridLines(profiles, n) {
+  return profiles.map(bands => {
+    const cell = bands[0].length / n;
+    const window = Math.round(cell * 0.13), flank = Math.round(cell * 0.27);
+    return Array.from({ length: n - 1 }, (_, i) => {
+      const pos = Math.round((i + 1) * cell);
+      let peak = 0;
+      for (let p = pos - window; p <= pos + window; p++) {
+        const a = bands[0][p] - Math.max(bands[0][p - flank], bands[0][p + flank]);
+        const b = bands[1][p] - Math.max(bands[1][p - flank], bands[1][p + flank]);
+        const c = bands[2][p] - Math.max(bands[2][p - flank], bands[2][p + flank]);
+        const middle = a + b + c - Math.min(a, b, c) - Math.max(a, b, c);
+        peak = Math.max(peak, middle);
+      }
+      return peak;
+    });
+  });
+}
+
+function liveGridContrast(lines) {
+  return Math.min(...lines.map(axis => {
+    const supported = axis.filter(v => v >= 1.25).length;
+    if (supported < Math.ceil(axis.length * 0.75)) return 0;
+    return axis.reduce((sum, value) => sum + value, 0) / axis.length;
+  }));
+}
+
+// 倍數格數要看原本格子內的額外格線，整體平均較弱時也能排除漏數。
+function hasSkippedGridLines(lines, factor) {
+  return lines.every(axis => {
+    const between = axis.filter((_, i) => (i + 1) % factor !== 0);
+    return between.filter(v => v >= 1.5).length >= Math.ceil(between.length * 0.6);
+  });
+}
+
+// 顏色遮罩若漏掉一角，用另外三角估出外推位置，再交給格線驗證。
+function completeLiveQuad(quad, width, height) {
+  const sides = quad.map(([x, y], i) => {
+    const next = quad[(i + 1) % 4];
+    return [next[0] - x, next[1] - y];
+  });
+  const side = Math.min(...sides.map(([x, y]) => Math.hypot(x, y)));
+  const out = [quad];
+  for (let i = 0; i < 4; i++) {
+    const [x, y] = quad[i];
+    const [ax, ay] = sides[i];
+    const [bx, by] = sides[(i + 3) % 4];
+    const [cx, cy] = sides[(i + 2) % 4];
+    const dx = ax + cx, dy = ay + cy;
+    if (Math.hypot(dx, dy) < side * 0.07) continue;
+    // 只考慮擴大盤面的外推，且角點須落在畫面內。
+    if (dx * (ay + by) - dy * (ax + bx) <= 0) continue;
+    for (const scale of [1, 0.86, 1.14]) {
+      const px = x + dx * scale, py = y + dy * scale;
+      if (px < 0 || px >= width || py < 0 || py >= height) continue;
+      const candidate = quad.slice();
+      candidate[i] = [px, py];
+      out.push(candidate);
+    }
+  }
+  return out;
+}
+
+// 檢查框外相鄰的一排格子。沿著既有格距，確認多條格線是否延伸到該排。
+function liveGridStrip(img, H, n, pos, rows) {
+  const { data, width, height } = img;
+  const brightness = (along, across) => {
+    const [x, y] = rows ? applyH(H, along, across) : applyH(H, across, along);
+    const ix = Math.round(x), iy = Math.round(y);
+    if (ix < 0 || ix >= width || iy < 0 || iy >= height) return NaN;
+    const i = (iy * width + ix) * 4;
+    return Math.min(data[i], data[i + 1], data[i + 2]);
+  };
+  let supported = 0;
+  for (let k = 1; k < n; k++) {
+    let peak = 0;
+    for (const offset of [0, -0.08, 0.08, -0.16, 0.16]) {
+      const line = k + offset;
+      let contrast = 0;
+      for (const sample of [-0.23, 0, 0.23]) {
+        const p = pos + sample;
+        contrast += brightness(line, p) - Math.max(brightness(line - 0.28, p), brightness(line + 0.28, p));
+      }
+      if (Number.isFinite(contrast)) peak = Math.max(peak, contrast / 3);
+    }
+    if (peak >= 2) supported++;
+  }
+  return supported >= Math.ceil((n - 1) * 0.65);
+}
+
+function extendLiveGrid(img, quad, n) {
+  const H = solveH([[0, 0], [n, 0], [n, n], [0, n]], quad);
+  const margins = [];
+  for (const [rows, before] of [[false, true], [true, true], [false, false], [true, false]]) {
+    let tiles = 0;
+    while (tiles < 12 - n + 1) {
+      const pos = before ? -tiles - 0.5 : n + tiles + 0.5;
+      if (!liveGridStrip(img, H, n, pos, rows)) break;
+      tiles++;
+    }
+    margins.push(tiles);
+  }
+  if (margins.every(v => v === 0)) return { quad, n };
+  const [left, top, right, bottom] = margins;
+  const cols = n + left + right, rows = n + top + bottom;
+  if (cols !== rows || cols > 12) return null;
+  const expanded = [[-left, -top], [n + right, -top], [n + right, n + bottom], [-left, n + bottom]]
+    .map(([x, y]) => applyH(H, x, y));
+  if (!expanded.every(([x, y]) => x >= 0 && x < img.width && y >= 0 && y < img.height)) return null;
+  return { quad: expanded, n: cols };
+}
+
+function liveGridCandidateContrast(profiles, n) {
+  const contrast = liveGridContrast(liveGridLines(profiles, n));
+  if (contrast < 1.25) return 0;
+  for (let finer = n * 2; finer <= 12; finer += n)
+    if (hasSkippedGridLines(liveGridLines(profiles, finer), finer / n)) return 0;
+  return contrast;
+}
+
+// 分別找每個色格的內部，再依大小、距離組成盤面。整片顏色的遮罩漏掉淡色時仍可使用。
+function findTileQuad(img) {
+  const { data, width: W, height: H } = img;
+  const step = Math.max(1, Math.ceil(Math.max(W, H) / 400));
+  const w = Math.floor(W / step), h = Math.floor(H / step);
+  const rgb = new Uint8Array(w * h * 3), used = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = (y * step * W + x * step) * 4, j = (y * w + x) * 3;
+    rgb[j] = data[i]; rgb[j + 1] = data[i + 1]; rgb[j + 2] = data[i + 2];
+  }
+  const minSide = Math.max(5, Math.floor(Math.min(w, h) / 42));
+  const maxSide = Math.ceil(Math.min(w, h) / 3.5);
+  const queue = new Int32Array(w * h), cell = [];
+  for (let seed = 0; seed < used.length; seed++) {
+    if (used[seed]) continue;
+    const si = seed * 3, rr = rgb[si], gg = rgb[si + 1], bb = rgb[si + 2];
+    let size = 1, x0 = w, y0 = h, x1 = 0, y1 = 0;
+    let minSum = Infinity, maxSum = -Infinity, minDiff = Infinity, maxDiff = -Infinity;
+    const corners = new Array(4);
+    const visit = (p, from) => {
+      if (used[p]) return;
+      const j = p * 3, k = from * 3;
+      const spread = Math.max(Math.abs(rgb[j] - rr), Math.abs(rgb[j + 1] - gg), Math.abs(rgb[j + 2] - bb));
+      if (spread > 13) return;
+      const local = Math.max(Math.abs(rgb[j] - rgb[k]), Math.abs(rgb[j + 1] - rgb[k + 1]), Math.abs(rgb[j + 2] - rgb[k + 2]));
+      if (local > 10) return;
+      used[p] = 1;
+      queue[size++] = p;
+    };
+    queue[0] = seed;
+    used[seed] = 1;
+    for (let k = 0; k < size; k++) {
+      const p = queue[k], x = p % w, y = (p / w) | 0;
+      x0 = Math.min(x, x0); x1 = Math.max(x, x1);
+      y0 = Math.min(y, y0); y1 = Math.max(y, y1);
+      if (x + y < minSum) { minSum = x + y; corners[0] = [x, y]; }
+      if (x - y > maxDiff) { maxDiff = x - y; corners[1] = [x, y]; }
+      if (x + y > maxSum) { maxSum = x + y; corners[2] = [x, y]; }
+      if (x - y < minDiff) { minDiff = x - y; corners[3] = [x, y]; }
+      if (x > 0) visit(p - 1, p);
+      if (x < w - 1) visit(p + 1, p);
+      if (y > 0) visit(p - w, p);
+      if (y < h - 1) visit(p + w, p);
+    }
+    const dx = x1 - x0 + 1, dy = y1 - y0 + 1;
+    if (Math.min(dx, dy) < minSide || Math.max(dx, dy) > maxSide) continue;
+    if (Math.min(dx, dy) / Math.max(dx, dy) < 0.66 || size / (dx * dy) < 0.64) continue;
+    cell.push({ x: (x0 + x1) / 2, y: (y0 + y1) / 2, side: (dx + dy) / 2, corners });
+  }
+
+  // 合併互相緊鄰、大小接近的方塊，排除棋盤外的圖示。
+  if (cell.length < 9 || cell.length > 450) return null;
+  const assigned = new Set();
+  let largest = [];
+  for (const tile of cell) {
+    if (assigned.has(tile)) continue;
+    assigned.add(tile);
+    const group = [tile];
+    for (const a of group) for (const b of cell) {
+      if (assigned.has(b) || Math.min(a.side, b.side) / Math.max(a.side, b.side) < 0.7) continue;
+      const dx = Math.abs(a.x - b.x), dy = Math.abs(a.y - b.y);
+      const pitch = (a.side + b.side) / 2;
+      if (Math.min(dx, dy) > pitch * 0.35 || Math.max(dx, dy) < pitch * 0.8 || Math.max(dx, dy) > pitch * 1.65) continue;
+      assigned.add(b);
+      group.push(b);
+    }
+    if (group.length > largest.length) largest = group;
+  }
+  if (largest.length < 9) return null;
+  return [([x,y]) => x+y, ([x,y]) => y-x, ([x,y]) => -x-y, ([x,y]) => x-y].map((measure, i) => {
+    const p = largest.reduce((best, c) => measure(c.corners[i]) < measure(best) ? c.corners[i] : best, largest[0].corners[i]);
+    return p.map(v => (v + 0.5) * step);
+  });
+}
+
+function findLiveQuad(img, S, forceN) {
+  const seen = new Set(), checked = new Set(), proposals = [];
+  const border = Math.max(2, Math.min(img.width, img.height) * 0.007);
+  const inFrame = quad => quad.every(([x, y]) =>
+    x >= border && x < img.width - border && y >= border && y < img.height - border);
+  const keyOf = quad => quad.flat().map(v => Math.round(v / 2)).join(',');
+  const profilesOf = quad => liveGridProfiles(warp(img, quad, 216));
+  for (const mode of ['tiles', 'background', 'pastel', 'sat', 'white']) {
+    const seed = mode === 'tiles' ? findTileQuad(img) : findGrid(img, mode);
+    if (!seed) continue;
+    for (const quad of completeLiveQuad(seed, img.width, img.height)) {
+      const key = keyOf(quad);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const profiles = profilesOf(quad);
+      for (let n = 4; n <= (forceN || 12); n++) {
+        let contrast = liveGridCandidateContrast(profiles, n);
+        if (!contrast) continue;
+
+        const full = extendLiveGrid(img, quad, n);
+        if (!full || (forceN && full.n !== forceN) || !inFrame(full.quad)) continue;
+        const fullKey = full.n + ':' + keyOf(full.quad);
+        if (checked.has(fullKey)) continue;
+        if (full.n !== n) {
+          contrast = liveGridCandidateContrast(profilesOf(full.quad), full.n);
+          if (!contrast) continue;
+        }
+        checked.add(fullKey);
+        proposals.push({ ...full, contrast });
+      }
+    }
+  }
+  // 先靠格線決定格數，解題有結果也不能用來改判成另一個格數。
+  proposals.sort((a, b) => b.contrast - a.contrast);
+  const detectedN = proposals[0]?.n;
+  let best = null, bestScore = -Infinity;
+  for (const { quad, n, contrast } of proposals) {
+    if (contrast <= bestScore) break;
+    if (n !== detectedN) continue;
+    const w = warp(img, quad, S);
+    const t = tryN(w, n);
+    if (!t.sol) continue;
+    const used = new Set(t.km.asg);
+    const colors = t.km.mean.filter((_, i) => used.has(i));
+    const colorRange = Math.max(...[0, 1, 2].map(i => {
+      const values = colors.map(c => c[i]);
+      return Math.max(...values) - Math.min(...values);
+    }));
+    if (colorRange < 6) continue;
+    const score = contrast - Math.min(t.sse, 100) * 0.06;
+    if (score > bestScore) {
+      bestScore = score;
+      best = { quad, n, sol: t.sol, H: w.H };
+    }
+  }
+  const geometry = proposals[0];
+  return best || (geometry ? { ...geometry, sol: null } : null);
+}
+
+class LiveTracker {
+  constructor(S) { this.S = S; this.reset(); }
+  reset() { this.previous = null; this.count = 0; }
+  feed(img, forceN) {
+    const result = findLiveQuad(boxBlur(img), this.S, forceN);
+    if (!result?.sol) { this.reset(); return result; }
+    const last = this.previous;
+    const stable = last && last.n === result.n && last.sol.every((c, i) => c === result.sol[i]) &&
+      result.quad.every(([x, y], i) =>
+        Math.hypot(x - last.quad[i][0], y - last.quad[i][1]) < Math.max(img.width, img.height) * 0.06);
+    this.count = stable ? this.count + 1 : 1;
+    this.previous = result;
+    return result;
+  }
+}
+// ==CORE_END==
+
+// ---------- 介面 ----------
+const $ = id => document.getElementById(id);
+const cv = $('view'), ctx = cv.getContext('2d');
+const st = { img: null, quad: null, n: 0, groups: null, mean: null, Hw: null, sol: null, S: 600 };
+
+function msg(t) { $('msg').textContent = t; }
+
+let photoRequest = 0;
+function loadFile(file) {
+  if (!file) return;
+  if (live.session || live.frozen) stopLive();
+  const request = ++photoRequest;
+  const url = URL.createObjectURL(file), im = new Image();
+  im.onload = () => {
+    URL.revokeObjectURL(url);
+    if (request !== photoRequest) return;
+    const sc = Math.min(1, 1000 / Math.max(im.naturalWidth, im.naturalHeight));
+    const W = Math.round(im.naturalWidth * sc), H = Math.round(im.naturalHeight * sc);
+    cv.width = W; cv.height = H;
+    ctx.drawImage(im, 0, 0, W, H);
+    st.img = ctx.getImageData(0, 0, W, H);
+    st.quad = findQuad(st.img);
+    st.groups = null; st.sol = null;
+    if (!st.quad) {
+      st.quad = [[W * .15, H * .15], [W * .85, H * .15], [W * .85, H * .85], [W * .15, H * .85]];
+      msg('自動找不到盤面，請拖曳紅點對齊四個角');
+      $('grid').innerHTML = '';
+      draw();
+    } else run();
+  };
+  im.onerror = () => {
+    URL.revokeObjectURL(url);
+    if (request === photoRequest) msg('圖片讀取失敗');
+  };
+  im.src = url;
+}
+
+function run() {
+  const w = warp(st.img, st.quad, st.S);
+  st.Hw = w.H;
+  const sel = $('nsel').value;
+  const t = sel === 'auto' ? autoN(w) : tryN(w, +sel);
+  st.n = t.n;
+  st.groups = t.groups;
+  st.mean = t.km.mean;
+  st.unk = t.unk || 0;
+  update();
+}
+
+function update() {
+  st.sol = solveGrid(st.groups);
+  msg(st.sol
+    ? `${st.n}×${st.n}，已解出 ✅ 小鳥在白圈位置` + (st.unk ? `（有 ${st.unk} 格被小鳥圖案/反光蓋住，已自動推算）` : '')
+    : `${st.n}×${st.n}，無解 ❌ 請修正顏色、格數或角點`);
+  draw();
+  renderGrid();
+}
+
+function draw(dragging) {
+  ctx.putImageData(st.img, 0, 0);
+  const q = st.quad;
+  ctx.lineWidth = 3; ctx.strokeStyle = '#00e676'; ctx.beginPath();
+  q.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]));
+  ctx.closePath(); ctx.stroke();
+  if (st.sol && st.Hw && !dragging) {
+    const cs = st.S / st.n;
+    const [ax, ay] = applyH(st.Hw, cs * .5, cs * .5), [bx, by] = applyH(st.Hw, cs * 1.5, cs * .5);
+    const rad = Math.hypot(ax - bx, ay - by) * 0.38;
+    ctx.font = `${rad * 1.5}px sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    st.sol.forEach((c, r) => {
+      const [x, y] = applyH(st.Hw, (c + .5) * cs, (r + .5) * cs);
+      ctx.beginPath(); ctx.arc(x, y, rad, 0, 7);
+      ctx.fillStyle = 'rgba(255,255,255,.92)'; ctx.fill();
+      ctx.lineWidth = 3; ctx.strokeStyle = '#d50000'; ctx.stroke();
+      ctx.fillStyle = '#000'; ctx.fillText('🐦', x, y + rad * 0.08);
+    });
+  }
+  q.forEach(p => {
+    ctx.beginPath(); ctx.arc(p[0], p[1], Math.max(10, cv.width * 0.015), 0, 7);
+    ctx.fillStyle = 'rgba(255,0,0,.8)'; ctx.fill();
+  });
+}
+
+function renderGrid() {
+  const g = $('grid');
+  g.style.gridTemplateColumns = `repeat(${st.n},1fr)`;
+  g.innerHTML = '';
+  st.groups.forEach((row, r) => row.forEach((k, c) => {
+    const d = document.createElement('div');
+    d.className = 'cell';
+    d.style.background = `rgb(${st.mean[k].join(',')})`;
+    if (st.sol && st.sol[r] === c) d.textContent = '🐦';
+    d.onclick = () => {
+      // 點一下：依序切換成「相鄰格的顏色」優先，再來才是其他顏色
+      const cur = st.groups[r][c], nb = [];
+      [[r - 1, c], [r + 1, c], [r, c - 1], [r, c + 1]].forEach(([y, x]) => {
+        if (y >= 0 && y < st.n && x >= 0 && x < st.n) nb.push(st.groups[y][x]);
+      });
+      const order = [...new Set([cur, ...nb, ...Array.from({ length: st.n }, (_, i) => i)])];
+      st.groups[r][c] = order[(order.indexOf(cur) + 1) % order.length];
+      update();
+    };
+    g.appendChild(d);
+  }));
+}
+
+// 拖曳四個角：只有手指「按在紅點上」才攔截觸控，其他地方照常捲動頁面
+let drag = -1;
+const getP = e => {
+  const t = e.touches && e.touches.length ? e.touches[0] : e, r = cv.getBoundingClientRect();
+  return [(t.clientX - r.left) * cv.width / r.width, (t.clientY - r.top) * cv.height / r.height];
+};
+const hit = p => {
+  let bi = -1, bd = cv.width * 0.07;
+  st.quad.forEach((q, i) => { const d = Math.hypot(q[0] - p[0], q[1] - p[1]); if (d < bd) { bd = d; bi = i; } });
+  return bi;
+};
+const dragStart = e => { if (!st.quad) return; const i = hit(getP(e)); if (i >= 0) { drag = i; e.preventDefault(); } };
+const dragMove = e => { if (drag < 0) return; e.preventDefault(); st.quad[drag] = getP(e); draw(true); };
+const dragEnd = () => { if (drag >= 0) { drag = -1; run(); } };
+cv.addEventListener('touchstart', dragStart, { passive: false });
+cv.addEventListener('touchmove', dragMove, { passive: false });
+cv.addEventListener('touchend', dragEnd);
+cv.addEventListener('touchcancel', dragEnd);
+cv.addEventListener('mousedown', dragStart);
+window.addEventListener('mousemove', dragMove);
+window.addEventListener('mouseup', dragEnd);
+
+// ---------- 即時模式 ----------
+const vid = $('vid'), ov = $('ov'), ovx = ov.getContext('2d');
+const off = document.createElement('canvas'), offx = off.getContext('2d', { willReadFrequently: true });
+const frame = document.createElement('canvas'), frameCtx = frame.getContext('2d');
+const live = { session: null, frozen: false, tr: new LiveTracker(480) };
+const liveBtn = $('livebtn'), relock = $('relock'), liveEdit = $('liveedit');
+
+function drawBirds(c, H, S, n, sol) {
+  const cs = S / n;
+  const [ax, ay] = applyH(H, cs * .5, cs * .5), [bx, by] = applyH(H, cs * 1.5, cs * .5);
+  const rad = Math.hypot(ax - bx, ay - by) * 0.38;
+  c.font = `${rad * 1.5}px sans-serif`; c.textAlign = 'center'; c.textBaseline = 'middle';
+  sol.forEach((col, r) => {
+    const [x, y] = applyH(H, (col + .5) * cs, (r + .5) * cs);
+    c.beginPath(); c.arc(x, y, rad, 0, 7);
+    c.fillStyle = 'rgba(255,255,255,.9)'; c.fill();
+    c.lineWidth = 3; c.strokeStyle = '#d50000'; c.stroke();
+    c.fillStyle = '#000'; c.fillText('🐦', x, y + rad * 0.08);
+  });
+}
+
+async function startLive() {
+  if (live.session) return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    msg('這個網址不能開鏡頭：即時模式需要 https 網址（例如 GitHub Pages）');
+    return;
+  }
+  const session = { stream: null, timer: null, wake: null, frame: null };
+  live.session = session;
+  liveBtn.textContent = '⏹ 停止即時';
+  relock.style.display = 'none';
+  msg('正在開啟相機…');
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    });
+    if (live.session !== session) {
+      stream.getTracks().forEach(track => track.stop());
+      return;
+    }
+    session.stream = stream;
+    vid.srcObject = stream;
+    await vid.play();
+  } catch (e) {
+    if (live.session !== session) return;
+    stopLive(live.frozen);
+    msg('無法開啟鏡頭：' + (e.name === 'NotAllowedError' ? '請在瀏覽器允許相機權限' : e.message));
+    return;
+  }
+  if (live.session !== session) return;
+  photoRequest++;
+  live.frozen = false;
+  live.tr.reset();
+  ovx.clearRect(0, 0, ov.width, ov.height);
+  ov.classList.remove('frozen');
+  vid.style.display = 'block';
+  $('livebox').style.display = 'block';
+  cv.style.display = 'none';
+  $('grid').style.display = 'none';
+  $('autolbl').style.display = 'block';
+  $('liveeditrow').style.display = 'flex';
+  liveEdit.disabled = true;
+  relock.style.display = 'block';
+  msg('請讓整個盤面入鏡並保持穩定');
+  if (navigator.wakeLock) {
+    navigator.wakeLock.request('screen').then(wake => {
+      if (live.session === session) session.wake = wake;
+      else return wake.release();
+    }).catch(() => {});
+  }
+  liveLoop(session);
+}
+
+function stopLive(frozen = false) {
+  const session = live.session;
+  live.session = null;
+  live.frozen = frozen;
+  if (session) {
+    clearTimeout(session.timer);
+    session.stream?.getTracks().forEach(track => track.stop());
+    session.wake?.release().catch(() => {});
+  }
+  vid.srcObject = null;
+  vid.style.display = frozen ? 'none' : 'block';
+  ov.classList.toggle('frozen', frozen);
+  $('livebox').style.display = frozen ? 'block' : 'none';
+  cv.style.display = frozen ? 'none' : 'block';
+  $('grid').style.display = frozen ? 'none' : '';
+  liveBtn.textContent = '🎥 即時模式';
+  liveBtn.style.display = frozen ? 'none' : '';
+  relock.style.display = frozen ? 'block' : 'none';
+  $('autolbl').style.display = 'none';
+  $('liveeditrow').style.display = 'none';
+  liveEdit.disabled = true;
+}
+
+function liveLoop(session) {
+  if (live.session !== session) return;
+  const now = performance.now();
+  try { liveStep(); } catch (e) { console.error(e); }
+  if (live.session === session)
+    session.timer = setTimeout(() => liveLoop(session), Math.max(40, 200 - (performance.now() - now)));
+}
+
+function liveStep() {
+  if (!vid.videoWidth || vid.readyState < 2) return;
+  const { videoWidth: width, videoHeight: height } = vid;
+  const scale = Math.min(1, 800 / Math.max(width, height));
+  const W = Math.round(width * scale), H = Math.round(height * scale);
+  if (frame.width !== width || frame.height !== height) { frame.width = width; frame.height = height; }
+  if (off.width !== W || off.height !== H) { off.width = W; off.height = H; }
+  frameCtx.drawImage(vid, 0, 0, width, height);
+  offx.drawImage(frame, 0, 0, W, H);
+  const image = offx.getImageData(0, 0, W, H);
+  const sel = $('nsel').value;
+  const capture = { image, quad: null, n: 0 };
+  live.session.frame = capture;
+  liveEdit.disabled = false;
+  const result = live.tr.feed(image, sel === 'auto' ? 0 : +sel);
+  if (result) {
+    capture.quad = result.quad;
+    capture.n = result.n;
+  }
+  ov.width = W;
+  ov.height = H;
+  if (!result) {
+    msg('尋找盤面中… 可以點「定格修角」手動對齊');
+    return;
+  }
+  if (live.tr.count >= 3) {
+    freezeResult(result, W, H);
+    return;
+  }
+  ovx.lineWidth = 3; ovx.strokeStyle = '#ffc107'; ovx.beginPath();
+  result.quad.forEach(([x, y], i) => i ? ovx.lineTo(x, y) : ovx.moveTo(x, y));
+  ovx.closePath(); ovx.stroke();
+  msg(result.sol ? `${result.n}×${result.n} 核對答案中…（${live.tr.count}/3）` :
+    `已找到 ${result.n}×${result.n}，色塊尚未辨識完成。可點「定格修角」。`);
+}
+
+let snapUrl = null, snapshotRequest = 0;
+function freezeResult(result, W, H) {
+  ov.width = frame.width;
+  ov.height = frame.height;
+  ovx.drawImage(frame, 0, 0);
+  ovx.save();
+  ovx.scale(frame.width / W, frame.height / H);
+  drawBirds(ovx, result.H, live.tr.S, result.n, result.sol);
+  ovx.restore();
+  const autoDownload = $('autosave').checked;
+  stopLive(true);
+  msg(`${result.n}×${result.n} 已解出 ✅ 即時畫面已停止`);
+
+  const request = ++snapshotRequest;
+  ov.toBlob(blob => {
+    if (!blob || request !== snapshotRequest) return;
+    const previousUrl = snapUrl;
+    snapUrl = URL.createObjectURL(blob);
+    $('snap').src = snapUrl;
+    const dl = $('dl');
+    dl.href = snapUrl;
+    dl.download = `bird-${result.n}x${result.n}-${Date.now()}.png`;
+    $('snapbox').style.display = 'block';
+    if (previousUrl) URL.revokeObjectURL(previousUrl);
+    if (autoDownload && live.frozen && !live.session) dl.click();
+  }, 'image/png');
+}
+
+liveEdit.onclick = () => {
+  const capture = live.session?.frame;
+  if (!capture) return;
+  const { image, quad, n } = capture;
+  stopLive();
+  cv.width = image.width;
+  cv.height = image.height;
+  st.img = image;
+  const size = Math.min(image.width, image.height) * 0.8;
+  const x = (image.width - size) / 2, y = (image.height - size) / 2;
+  st.quad = quad?.map(p => p.slice()) || [[x, y], [x + size, y], [x + size, y + size], [x, y + size]];
+  st.groups = null;
+  st.sol = null;
+  st.Hw = null;
+  $('grid').innerHTML = '';
+  const hint = n ? `（畫面估計 ${n}×${n}）` : '';
+  msg(`已定格${hint}。拖曳四個紅點到棋盤外角，或手動選擇格數。`);
+  draw();
+};
+
+liveBtn.onclick = () => {
+  if (!live.session) { startLive(); return; }
+  stopLive();
+  msg('已停止即時模式');
+};
+relock.onclick = () => {
+  if (live.session) {
+    live.tr.reset();
+    msg('重新偵測中…');
+    return;
+  }
+  liveBtn.style.display = '';
+  startLive();
+};
+for (const id of ['cam', 'pick']) {
+  $(id).onchange = e => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    loadFile(file);
+  };
+}
+$('nsel').onchange = () => {
+  if (live.session) live.tr.reset();
+  else if (!live.frozen && st.img && st.quad) run();
+};
+</script>
+</body>
+</html>
